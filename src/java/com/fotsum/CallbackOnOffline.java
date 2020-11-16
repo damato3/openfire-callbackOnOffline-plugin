@@ -1,5 +1,6 @@
 package com.fotsum;
 
+import org.jivesoftware.openfire.OfflineMessageStrategy;
 import org.jivesoftware.openfire.PresenceManager;
 import org.jivesoftware.openfire.XMPPServer;
 import org.jivesoftware.openfire.container.Plugin;
@@ -26,6 +27,7 @@ import javax.ws.rs.core.Response;
 import java.io.File;
 import java.util.UUID;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public class CallbackOnOffline implements Plugin, PacketInterceptor {
 
@@ -45,6 +47,7 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
     private UserManager userManager;
     private PresenceManager presenceManager;
     private Client client;
+    private OfflineMessageStrategy offlineMessageStrategy;
 
     public void initializePlugin(PluginManager pManager, File pluginDirectory) {
         debug = JiveGlobals.getBooleanProperty(PROPERTY_DEBUG, false);
@@ -53,22 +56,19 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
         url = getProperty(PROPERTY_URL, "http://localhost:8080/user/offline/callback/url");
         token = getProperty(PROPERTY_TOKEN, UUID.randomUUID().toString());
 
-        if (debug) {
-            Log.debug("initialize CallbackOnOffline plugin. Start.");
-            Log.debug("Loaded properties: \nurl={}, \ntoken={}, \nsendBody={}", new Object[]{url, token, sendBody});
-        }
+        logDebug("initialize CallbackOnOffline plugin. Start.");
+        logDebug("Loaded properties: \nurl={}, \ntoken={}, \nsendBody={}", new Object[]{url, token, sendBody});
 
         interceptorManager = InterceptorManager.getInstance();
         presenceManager = XMPPServer.getInstance().getPresenceManager();
         userManager = XMPPServer.getInstance().getUserManager();
         client = ClientBuilder.newClient();
+        offlineMessageStrategy = XMPPServer.getInstance().getOfflineMessageStrategy();
 
         // register with interceptor manager
         interceptorManager.addInterceptor(this);
 
-        if (debug) {
-            Log.debug("initialize CallbackOnOffline plugin. Finish.");
-        }
+        logDebug("initialize CallbackOnOffline plugin. Finish.");
     }
 
     private String getProperty(String code, String defaultSetValue) {
@@ -84,66 +84,112 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
     public void destroyPlugin() {
         // unregister with interceptor manager
         interceptorManager.removeInterceptor(this);
-        if (debug) {
-            Log.debug("destroy CallbackOnOffline plugin.");
-        }
+        logDebug("destroy CallbackOnOffline plugin.");
     }
 
 
     public void interceptPacket(Packet packet, Session session, boolean incoming,
                                 boolean processed) throws PacketRejectedException {
         if (processed
-                && incoming
-                && packet instanceof Message
-                && packet.getTo() != null) {
+            && incoming
+            && packet instanceof Message
+            && packet.getTo() != null) {
 
             Message msg = (Message) packet;
             JID to = packet.getTo();
 
-            if (msg.getType() != Message.Type.chat) {
+            if (msg.getType() != Message.Type.chat || msg.getBody() == null || msg.getBody().isEmpty()) {
                 return;
             }
 
             try {
+                User userFrom = userManager.getUser(packet.getFrom().getNode());
                 User userTo = userManager.getUser(to.getNode());
-                boolean available = presenceManager.isAvailable(userTo);
-
-                if (debug) {
-                    Log.debug("intercepted message from {} to {}, recipient is available {}", new Object[]{packet.getFrom().toBareJID(), to.toBareJID(), available});
-                }
-
-                if (!available) {
-                    JID from = packet.getFrom();
-                    String body = sendBody ? msg.getBody() : null;
-
-                    WebTarget target = client.target(url);
-
-                    if (debug) {
-                        Log.debug("sending request to url='{}'", target);
-                    }
-
-                    MessageData data = new MessageData(token, from.toBareJID(), to.toBareJID(), body);
-
-                    Future<Response> responseFuture = target
-                            .request()
-                            .async()
-                            .post(Entity.json(data));
-
-                    if (debug) {
+                if (saveOfflineMessage(msg, userFrom, userTo, to, false)) {
+                    // Create a thread to check after 7 seconds if the user is actually online
+                    new Thread(() -> {
                         try {
-                            Response response = responseFuture.get();
-                            Log.debug("got response status url='{}' status='{}'", target, response.getStatus());
-                        } catch (Exception e) {
-                            Log.debug("can't get response status url='{}'", target, e);
+                            logDebug("Wait 7 seconds before we verify if the message was actually sent to an available user");
+                            TimeUnit.SECONDS.sleep(7);
+                            saveOfflineMessage(msg, userFrom, userTo, to, true);
+                        } catch (InterruptedException ie) {
+                            logDebug("Error saving offline message");
+                            Thread.currentThread().interrupt();
                         }
-                    }
+                    }).start();
                 }
             } catch (UserNotFoundException e) {
-                if (debug) {
-                    Log.debug("can't find user with name: " + to.getNode());
+                logDebug("can't find user with name: " + to.getNode());
+            }
+        }
+    }
+
+    public boolean saveOfflineMessage(Message message, User userFrom, User userTo, JID to, boolean saveOffline) {
+        boolean available = presenceManager.isAvailable(userTo);
+
+        logDebug("intercepted message from {} to {}, recipient is available {}",
+            new Object[]{message.getFrom().toBareJID(), to.toBareJID(), available});
+        logDebug("Saving and calling Offline URL...");
+
+        if (!available) {
+            String body = sendBody ? message.getBody() : null;
+
+            WebTarget target = client.target(url);
+
+            logDebug("sending request to url='{}'", target);
+
+            MessageData data = new MessageData(userFrom.getName(), to.toBareJID(), body);
+
+            logDebug("Sending notification: " + data.toString());
+
+            Future<Response> responseFuture = target
+                .request()
+                .header("Authorization", token)
+                .async()
+                .post(Entity.json(data));
+
+            // Also store the message offline so the user can receive it later.
+            try {
+                offlineMessageStrategy.storeOffline(message);
+            } catch (Exception e) {
+                logDebug("Error saving offline message");
+            }
+
+            if (debug) {
+                try {
+                    Response response = responseFuture.get();
+                    logDebug("got response status url='{}' status='{}'", target, response.getStatus());
+                } catch (Exception e) {
+                    logDebug("can't get response status url='{}'", target, e);
                 }
             }
         }
+
+        return available;
+    }
+
+    /**
+     * Helper method to log Debug messages.
+     *
+     * @param message String message
+     * @param objects parameters
+     */
+    private void logDebug(String message, Object[] objects) {
+        if (debug) {
+            Log.debug(message, objects);
+        }
+    }
+
+    private void logDebug(String message, Object object) {
+        logDebug(message, new Object[]{object});
+    }
+
+    private void logDebug(String message, Object object, Object object2) {
+        logDebug(message, new Object[]{object, object2});
+    }
+
+    private void logDebug(String message) {
+        logDebug(message, null);
     }
 
 }
