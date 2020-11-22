@@ -1,8 +1,8 @@
 package com.fotsum;
 
-import org.jivesoftware.openfire.OfflineMessageStrategy;
-import org.jivesoftware.openfire.PresenceManager;
-import org.jivesoftware.openfire.XMPPServer;
+import org.dom4j.Element;
+import org.jivesoftware.database.DbConnectionManager;
+import org.jivesoftware.openfire.*;
 import org.jivesoftware.openfire.container.Plugin;
 import org.jivesoftware.openfire.container.PluginManager;
 import org.jivesoftware.openfire.interceptor.InterceptorManager;
@@ -13,6 +13,9 @@ import org.jivesoftware.openfire.user.User;
 import org.jivesoftware.openfire.user.UserManager;
 import org.jivesoftware.openfire.user.UserNotFoundException;
 import org.jivesoftware.util.JiveGlobals;
+import org.jivesoftware.util.LocaleUtils;
+import org.jivesoftware.util.StringUtils;
+import org.jivesoftware.util.XMPPDateTimeFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.xmpp.packet.JID;
@@ -25,6 +28,11 @@ import javax.ws.rs.client.Entity;
 import javax.ws.rs.client.WebTarget;
 import javax.ws.rs.core.Response;
 import java.io.File;
+import java.io.StringReader;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.util.Date;
 import java.util.UUID;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -53,7 +61,7 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
         debug = JiveGlobals.getBooleanProperty(PROPERTY_DEBUG, false);
         sendBody = JiveGlobals.getBooleanProperty(PROPERTY_SEND_BODY, true);
 
-        url = getProperty(PROPERTY_URL, "http://localhost:8080/user/offline/callback/url");
+        url = getProperty(PROPERTY_URL, "http://localhost/user/offline/callback/url");
         token = getProperty(PROPERTY_TOKEN, UUID.randomUUID().toString());
 
         logDebug("initialize CallbackOnOffline plugin. Start.");
@@ -105,13 +113,20 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
             try {
                 User userFrom = userManager.getUser(packet.getFrom().getNode());
                 User userTo = userManager.getUser(to.getNode());
-                if (saveOfflineMessage(msg, userFrom, userTo, to, false)) {
-                    // Create a thread to check after 7 seconds if the user is actually online
+
+                boolean available = presenceManager.isAvailable(userTo);
+
+                // Quick check to determine user availability
+                if (!available) {
+                    sendNotification(msg, userFrom, userTo, to);
+                }
+                else {
                     new Thread(() -> {
                         try {
                             logDebug("Wait 7 seconds before we verify if the message was actually sent to an available user");
                             TimeUnit.SECONDS.sleep(7);
-                            saveOfflineMessage(msg, userFrom, userTo, to, true);
+                            sendNotification(msg, userFrom, userTo, to);
+                            saveOfflineMessage(msg, userFrom, userTo, to);
                         } catch (InterruptedException ie) {
                             logDebug("Error saving offline message");
                             Thread.currentThread().interrupt();
@@ -124,14 +139,14 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
         }
     }
 
-    public boolean saveOfflineMessage(Message message, User userFrom, User userTo, JID to, boolean saveOffline) {
+    public boolean sendNotification(Message message, User userFrom, User userTo, JID to) {
         boolean available = presenceManager.isAvailable(userTo);
 
         logDebug("intercepted message from {} to {}, recipient is available {}",
             new Object[]{message.getFrom().toBareJID(), to.toBareJID(), available});
-        logDebug("Saving and calling Offline URL...");
 
         if (!available) {
+            logDebug("Saving and calling Offline URL...");
             String body = sendBody ? message.getBody() : null;
 
             WebTarget target = client.target(url);
@@ -148,13 +163,6 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
                 .async()
                 .post(Entity.json(data));
 
-            // Also store the message offline so the user can receive it later.
-            try {
-                offlineMessageStrategy.storeOffline(message);
-            } catch (Exception e) {
-                logDebug("Error saving offline message");
-            }
-
             if (debug) {
                 try {
                     Response response = responseFuture.get();
@@ -166,6 +174,22 @@ public class CallbackOnOffline implements Plugin, PacketInterceptor {
         }
 
         return available;
+    }
+
+    /**
+     * Store the message offline so the user can receive it later.
+     *
+     * @param message message instance
+     * @param userFrom user 'from' instance
+     * @param userTo user 'to' instance
+     * @param to user JID instance
+     */
+    public void saveOfflineMessage(Message message, User userFrom, User userTo, JID to) {
+        try {
+            offlineMessageStrategy.storeOffline(message);
+        } catch (Exception e) {
+            logDebug("Error saving offline message");
+        }
     }
 
     /**
